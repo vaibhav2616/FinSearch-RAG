@@ -23,9 +23,10 @@ from retriever import (
     FallbackCrossEncoderReranker,
     get_finsearch_retriever
 )
-from chain import FinSearchChain, DeterministicOfflineLLM
+from chain import FinSearchChain, DeterministicOfflineLLM, detect_provider_from_key
 from evaluate_ragas import run_evaluation, compute_deterministic_sample_metrics
 from data.sec_data import SEC_10K_DOCUMENTS, GOLD_BENCHMARK_QA
+from langchain_core.documents import Document
 
 
 @pytest.fixture(scope="module")
@@ -139,7 +140,10 @@ def test_negative_financial_guardrails(offline_chain):
     """Verifies that the chain refuses speculation and handles ungrounded companies."""
     res_tsla = offline_chain.answer_query("Should I buy Tesla stock and what is TSLA FY2025 revenue prediction?")
     ans_lower = res_tsla["answer"].lower()
-    assert "do not contain this information" in ans_lower or "covers apple" in ans_lower
+    assert "out of scope" in ans_lower or "do not contain" in ans_lower
+
+    res_buy_aapl = offline_chain.answer_query("Should I buy Apple stock right now?")
+    assert "out of scope" in res_buy_aapl["answer"].lower()
 
 
 def test_evaluation_pipeline_metrics():
@@ -167,3 +171,69 @@ def test_deterministic_metric_calculator():
     assert metrics["faithfulness"] == 1.0
     assert metrics["response_relevancy"] >= 0.90
     assert metrics["context_precision"] >= 0.90
+
+
+def test_dynamic_ingestion_and_zero_hardcoding(retriever, offline_chain):
+    """
+    Verifies live document ingestion (add_documents & ingest_uploaded_file)
+    with a fictional company report and queries it dynamically to prove zero hardcoding.
+    """
+    custom_md = (
+        "# NovaTech Corp FY2024 Annual Financial Summary\n\n"
+        "| Financial Metric | FY2024 | FY2023 |\n"
+        "| :--- | :--- | :--- |\n"
+        "| **Total Revenue** | $ 42,500 | $ 35,000 |\n"
+        "| **Operating Income** | $ 12,750 | $ 9,800 |\n"
+        "| **Free Cash Flow** | $ 10,200 | $ 8,100 |\n\n"
+        "NovaTech Corp achieved 21.43% YoY revenue growth driven by quantum cloud adoption."
+    ).encode("utf-8")
+
+    added = retriever.ingest_uploaded_file(custom_md, "novatech_fy24.md", ticker="NVTC")
+    assert added == 1
+    assert "NVTC" in retriever.get_available_tickers()
+
+    # CSV ingestion test
+    csv_bytes = b"Segment,FY2024,FY2023\nQuantum Cloud,25000,19000\nEdge Hardware,17500,16000\n"
+    added_csv = retriever.ingest_uploaded_file(csv_bytes, "novatech_segments.csv", ticker="NVTC")
+    assert added_csv == 1
+
+    # Query dynamically with ticker_filter="NVTC"
+    res = offline_chain.answer_query(
+        "What was NovaTech's total revenue and operating income in FY2024?",
+        ticker_filter="NVTC",
+    )
+    assert "42,500" in res["answer"]
+    assert "12,750" in res["answer"]
+    assert all(doc.metadata.get("ticker") == "NVTC" for doc, _ in res["scored_documents"])
+
+
+def test_universal_api_key_auto_detection():
+    """Verifies Universal AI API key prefix auto-detection."""
+    assert detect_provider_from_key("") == "offline"
+    assert detect_provider_from_key("AIzaSyDummyKey123") == "gemini"
+    assert detect_provider_from_key("gsk_dummyKey123") == "groq"
+    assert detect_provider_from_key("sk-or-v1-dummyKey123") == "openrouter"
+    assert detect_provider_from_key("sk-proj-dummyKey123") == "openai"
+
+
+def test_app_ui_smoke_light_dark_and_chat():
+    """AppTest UI smoke test covering Light/Dark theme toggle and chat query."""
+    from streamlit.testing.v1 import AppTest
+
+    app_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "app.py"))
+    at = AppTest.from_file(app_path, default_timeout=30).run()
+    assert not at.exception
+
+    # Toggle Light theme
+    at.segmented_control(key="theme_mode").set_value("Light").run()
+    assert not at.exception
+
+    # Toggle back to Dark theme
+    at.segmented_control(key="theme_mode").set_value("Dark").run()
+    assert not at.exception
+
+    # Submit a chat query
+    at.chat_input(key="finsearch_chat_input").set_value("What was Apple's total net sales in FY2023?").run(timeout=30)
+    assert not at.exception
+    rendered_text = " ".join(m.value for m in at.markdown)
+    assert "383,285" in rendered_text

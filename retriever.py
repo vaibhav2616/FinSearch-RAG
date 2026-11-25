@@ -15,11 +15,13 @@ Architecture:
 """
 
 import os
+import io
 import re
 import math
 from typing import List, Dict, Any, Optional, Tuple
 from collections import Counter
 
+import pandas as pd
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.storage import InMemoryStore
@@ -173,6 +175,20 @@ class FinSearchRetrieverEngine:
             self.cross_encoder = FallbackCrossEncoderReranker()
             self.is_offline_reranker = True
 
+    def _rebuild_sparse_and_ensemble(self):
+        """Rebuilds BM25Retriever and EnsembleRetriever from all raw_documents."""
+        if not self.raw_documents:
+            self.bm25_retriever = None
+            self.ensemble_retriever = None
+            return
+        parent_docs = self.parent_splitter.split_documents(self.raw_documents)
+        self.bm25_retriever = BM25Retriever.from_documents(parent_docs)
+        self.bm25_retriever.k = 5
+        self.ensemble_retriever = EnsembleRetriever(
+            retrievers=[self.bm25_retriever, self.parent_retriever],
+            weights=[0.4, 0.6]
+        )
+
     def _ingest_sec_corpus(self):
         """Ingests SEC 10-K documents into ParentDocumentRetriever and BM25."""
         docs = []
@@ -188,34 +204,164 @@ class FinSearchRetrieverEngine:
                 }
             )
             docs.append(doc)
-        
-        self.raw_documents = docs
-        
-        # Ingest into ParentDocumentRetriever (populates vectorstore with child chunks and parent_store with parent chunks)
-        self.parent_retriever.add_documents(docs)
 
-        # Create BM25 retriever on parent-chunked or raw documents
-        parent_docs = self.parent_splitter.split_documents(docs)
-        self.bm25_retriever = BM25Retriever.from_documents(parent_docs)
-        self.bm25_retriever.k = 5
+        self.add_documents(docs)
 
-        # Create EnsembleRetriever with Reciprocal Rank Fusion (weights: 0.4 BM25, 0.6 Dense)
-        self.ensemble_retriever = EnsembleRetriever(
-            retrievers=[self.bm25_retriever, self.parent_retriever],
-            weights=[0.4, 0.6]
-        )
+    def add_documents(self, documents: List[Document]) -> int:
+        """
+        Dynamically indexes new Document objects into ParentDocumentRetriever
+        (InMemoryStore + ChromaDB) and rebuilds BM25 + EnsembleRetriever.
+        """
+        if not documents:
+            return 0
+        self.raw_documents.extend(documents)
+        self.parent_retriever.add_documents(documents)
+        self._rebuild_sparse_and_ensemble()
+        return len(documents)
 
-    def naive_vector_retrieve(self, query: str, top_k: int = 5) -> List[Document]:
+    def ingest_uploaded_file(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        ticker: str = "CUSTOM"
+    ) -> int:
+        """
+        Parses an uploaded PDF, TXT, MD, or CSV financial filing and indexes it live.
+        Returns the number of Document objects added.
+        """
+        if not file_bytes or not filename:
+            return 0
+
+        clean_ticker = (ticker or "CUSTOM").strip().upper()
+        ext = os.path.splitext(filename.lower())[1]
+        docs: List[Document] = []
+
+        if ext == ".pdf":
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(file_bytes))
+            for idx, page in enumerate(reader.pages, 1):
+                page_text = (page.extract_text() or "").strip()
+                if page_text:
+                    docs.append(
+                        Document(
+                            page_content=page_text,
+                            metadata={
+                                "ticker": clean_ticker,
+                                "company": filename,
+                                "fiscal_year": "Uploaded",
+                                "section": f"Page {idx}",
+                                "title": f"{filename} (Page {idx})",
+                                "source": filename,
+                            },
+                        )
+                    )
+        elif ext == ".csv":
+            df = pd.read_csv(io.BytesIO(file_bytes))
+            headers = [str(c) for c in df.columns]
+            md_lines = [
+                "| " + " | ".join(headers) + " |",
+                "| " + " | ".join([":---"] * len(headers)) + " |",
+            ]
+            for _, row in df.iterrows():
+                vals = [str(v).replace("\n", " ").strip() for v in row.tolist()]
+                md_lines.append("| " + " | ".join(vals) + " |")
+            md_table = f"# {filename}\n\n" + "\n".join(md_lines)
+            docs.append(
+                Document(
+                    page_content=md_table,
+                    metadata={
+                        "ticker": clean_ticker,
+                        "company": filename,
+                        "fiscal_year": "Uploaded",
+                        "section": "CSV Financial Table",
+                        "title": filename,
+                        "source": filename,
+                    },
+                )
+            )
+        elif ext in (".txt", ".md"):
+            text = file_bytes.decode("utf-8", errors="replace").strip()
+            if text:
+                docs.append(
+                    Document(
+                        page_content=text,
+                        metadata={
+                            "ticker": clean_ticker,
+                            "company": filename,
+                            "fiscal_year": "Uploaded",
+                            "section": "Uploaded Filing",
+                            "title": filename,
+                            "source": filename,
+                        },
+                    )
+                )
+        else:
+            raise ValueError(f"Unsupported file format '{ext}'. Supported: .pdf, .txt, .md, .csv")
+
+        return self.add_documents(docs)
+
+    def get_available_tickers(self) -> List[str]:
+        """Returns ordered unique tickers currently indexed in the corpus."""
+        seen = []
+        for doc in self.raw_documents:
+            t = str(doc.metadata.get("ticker", "")).strip().upper()
+            if t and t not in seen:
+                seen.append(t)
+        return seen
+
+    def _apply_ticker_filter(
+        self,
+        docs: List[Document],
+        ticker_filter: Optional[str],
+        top_k: int
+    ) -> List[Document]:
+        """Filters retrieved documents by ticker if ticker_filter is specified and not 'ALL'."""
+        if not ticker_filter or ticker_filter.strip().upper() == "ALL":
+            return docs[:top_k]
+
+        target = ticker_filter.strip().upper()
+        filtered = [d for d in docs if str(d.metadata.get("ticker", "")).upper() == target]
+
+        if len(filtered) < top_k:
+            # Backfill from raw_documents matching the ticker so filtered queries never miss
+            existing_contents = {d.page_content for d in filtered}
+            matching_raw = [
+                d for d in self.raw_documents
+                if str(d.metadata.get("ticker", "")).upper() == target
+            ]
+            for chunk in self.parent_splitter.split_documents(matching_raw):
+                if chunk.page_content not in existing_contents:
+                    filtered.append(chunk)
+                    existing_contents.add(chunk.page_content)
+                if len(filtered) >= top_k:
+                    break
+
+        return filtered[:top_k]
+
+    def naive_vector_retrieve(
+        self,
+        query: str,
+        top_k: int = 5,
+        ticker_filter: Optional[str] = None
+    ) -> List[Document]:
         """Performs baseline naive dense vector retrieval (direct similarity on parent docs)."""
-        # Retrieve parent documents directly from parent retriever
         docs = self.parent_retriever.invoke(query)
+        if ticker_filter and ticker_filter.strip().upper() != "ALL":
+            return self._apply_ticker_filter(docs, ticker_filter, top_k)
         return docs[:top_k]
 
-    def hybrid_retrieve(self, query: str, top_k: int = 5) -> List[Document]:
+    def hybrid_retrieve(
+        self,
+        query: str,
+        top_k: int = 5,
+        ticker_filter: Optional[str] = None
+    ) -> List[Document]:
         """Performs hybrid retrieval using BM25 + ParentDocumentRetriever via RRF."""
         if self.ensemble_retriever is None:
-            return self.naive_vector_retrieve(query, top_k=top_k)
+            return self.naive_vector_retrieve(query, top_k=top_k, ticker_filter=ticker_filter)
         docs = self.ensemble_retriever.invoke(query)
+        if ticker_filter and ticker_filter.strip().upper() != "ALL":
+            return self._apply_ticker_filter(docs, ticker_filter, top_k)
         return docs[:top_k]
 
     def rerank(
@@ -246,14 +392,19 @@ class FinSearchRetrieverEngine:
         self,
         query: str,
         top_k_retrieve: int = 6,
-        top_k_rerank: int = 3
+        top_k_rerank: int = 3,
+        ticker_filter: Optional[str] = None
     ) -> List[Tuple[Document, float]]:
         """
         Complete retrieval pipeline:
         1. Hybrid Search (BM25 + ParentDocumentRetriever with RRF)
         2. Cross-Encoder Reranker
         """
-        initial_docs = self.hybrid_retrieve(query, top_k=top_k_retrieve)
+        initial_docs = self.hybrid_retrieve(
+            query,
+            top_k=top_k_retrieve,
+            ticker_filter=ticker_filter
+        )
         reranked = self.rerank(query, initial_docs, top_k=top_k_rerank)
         return reranked
 

@@ -59,7 +59,7 @@ def compute_deterministic_sample_metrics(
     topic_score = topic_matches / len(expected_topics) if expected_topics else 0.9
     
     # Penalize if refusal message when answer should exist
-    if "do not contain this information" in ans_lower:
+    if "do not contain" in ans_lower or "out of scope" in ans_lower:
         relevancy = 0.20
     else:
         relevancy = min(1.0, 0.70 + 0.30 * topic_score)

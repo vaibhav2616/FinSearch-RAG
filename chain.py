@@ -2,39 +2,43 @@
 FinSearch-Pro Generation & Multi-Provider LLM Chain.
 
 Supports:
+- Auto-detection via Universal AI API Key (`AIza...` -> Gemini, `gsk_...` -> Groq, `sk-or-...` -> OpenRouter, `sk-...` -> OpenAI)
 - Gemini: `gemini-2.5-flash-lite`, `gemini-2.5-flash`
 - Groq: `llama-3.1-8b-instant`
 - OpenAI / OpenRouter: `gpt-4.1-nano`, `gpt-4o-mini`
-- Local Deterministic Offline Generator (for offline test reproducibility and zero-cost local execution)
+- Dynamic Context-Driven Offline Synthesizer (zero-hardcoding, parses retrieved tables & prose)
 
 Features:
-- Enforces strict SEC 10-K ground truth preservation.
-- Negative financial guardrails: refuses hallucination when data is absent or speculative.
-- Formats step-by-step arithmetic explanations for EPS, CapEx, FCF, and Revenue.
+- Enforces strict retrieved-context ground truth preservation.
+- Negative financial guardrails: concise out-of-scope refusal when evidence is absent or speculative.
+- Formats dynamic arithmetic/comparisons from extracted tabular figures.
 """
 
 import os
 import re
 from typing import Dict, Any, List, Optional, Tuple
 from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
 
 from retriever import FinSearchRetrieverEngine, get_finsearch_retriever
 
 
+OUT_OF_SCOPE_REFUSAL = (
+    "Out of scope: The indexed financial filings do not contain evidence to answer this question."
+)
+
 FINANCIAL_SYSTEM_PROMPT = """You are FinSearch-Pro, an elite SEC Form 10-K Corporate Intelligence and Financial Analyst assistant.
-Analyze the provided SEC 10-K excerpts with extreme precision and adhere to strict financial reporting principles:
+Analyze the provided financial filing excerpts with extreme precision and adhere to strict financial reporting principles:
 
 CRITICAL INSTRUCTIONS:
-1. ONLY use figures, metrics, calculations, and disclosures present in the provided SEC 10-K Context.
+1. ONLY use figures, metrics, calculations, and disclosures present in the provided Context.
 2. PRESERVE multi-column table numbers with exact dollar amounts (e.g., $383,285 million).
 3. If an explicit calculation is requested (such as Free Cash Flow, CapEx change, Operating Margin, or EPS):
    - State the exact formula used (e.g., Operating Cash Flow - CapEx = Free Cash Flow).
    - Show the step-by-step arithmetic with source figures from the tables.
    - Express percentages to two decimal places (e.g., 29.82%).
 4. FINANCIAL NEGATIVE GUARDRAILS:
-   - If the requested data, ticker, or fiscal period is NOT present in the provided context, clearly declare: "The provided SEC 10-K filings do not contain this information."
+   - If the requested data, ticker, or fiscal period is NOT present in the provided context, clearly declare: "Out of scope: The indexed financial filings do not contain evidence to answer this question."
    - Do NOT speculate on future stock prices, make investment buy/sell recommendations, or extrapolate non-reported numbers.
 
 Context:
@@ -46,162 +50,398 @@ Question:
 Structured Financial Answer (include Source Citation & Arithmetic if applicable):"""
 
 
+def detect_provider_from_key(api_key: Optional[str]) -> str:
+    """Detects the LLM provider from an API key prefix."""
+    if not api_key or not api_key.strip():
+        return "offline"
+    key = api_key.strip()
+    if key.startswith("AIza"):
+        return "gemini"
+    if key.startswith("gsk_"):
+        return "groq"
+    if key.startswith("sk-or-"):
+        return "openrouter"
+    if key.startswith("sk-"):
+        return "openai"
+    return "openai"
+
+
+def _resolve_auto_provider(api_key: Optional[str]) -> Tuple[str, Optional[str]]:
+    """Resolves provider and key when provider='auto'."""
+    if api_key and api_key.strip():
+        return detect_provider_from_key(api_key), api_key.strip()
+    for env_name, prov in [
+        ("GEMINI_API_KEY", "gemini"),
+        ("GOOGLE_API_KEY", "gemini"),
+        ("GROQ_API_KEY", "groq"),
+        ("OPENROUTER_API_KEY", "openrouter"),
+        ("OPENAI_API_KEY", "openai"),
+    ]:
+        val = os.getenv(env_name)
+        if val and val.strip():
+            return prov, val.strip()
+    return "offline", None
+
+
 class DeterministicOfflineLLM:
     """
-    Offline deterministic financial answer synthesizer.
-    Produces rigorous, factual answers using extracted numbers from context
-    for offline execution and CI/CD verification.
+    Dynamic, context-driven offline financial answer synthesizer.
+    Parses retrieved Markdown tables and prose chunks from the prompt context
+    without any hardcoded company or metric answers.
     """
+
+    _STOPWORDS = {
+        "what", "was", "were", "the", "in", "for", "of", "and", "or", "how",
+        "did", "it", "to", "a", "an", "is", "are", "with", "from", "by", "on",
+        "at", "which", "company", "had", "between", "produce", "produced",
+        "generate", "generated", "much", "compare", "total", "year", "fiscal",
+        "among", "does", "its", "their", "this", "that", "these", "those",
+        "can", "you", "tell", "me", "give", "show", "list", "explain", "about",
+        "highest", "lowest", "most", "least", "achieved", "achieve", "over",
+        "percentage", "breakdown", "amount", "used", "formula", "step",
+    }
+
+    _IGNORED_PROPER_NOUNS = {
+        "What", "Which", "How", "When", "Where", "Why", "Who", "Compare",
+        "Show", "List", "Calculate", "Tell", "Give", "Explain", "Does", "Did",
+        "Was", "Were", "Are", "Is", "The", "In", "For", "Of", "And", "Or",
+        "Among", "Between", "Should", "Could", "Would", "Can", "Will",
+        "Revenue", "Revenues", "Sales", "Net", "Income", "Operating", "Margin",
+        "Margins", "Gross", "Profit", "Cash", "Flow", "Free", "Capital",
+        "Expenditures", "Expenditure", "CapEx", "EPS", "Diluted", "Basic",
+        "Total", "Segment", "Cloud", "Search", "Services", "Products",
+        "Product", "Assets", "Liabilities", "Equity", "Balance", "Sheet",
+        "FY", "FY2021", "FY2022", "FY2023", "FY2024", "FY2025", "FY21", "FY22",
+        "FY23", "FY24", "FY25", "Q1", "Q2", "Q3", "Q4", "USD", "GAAP", "SEC",
+        "10-K", "MD&A", "Item", "YoY", "AI", "Stock", "Price", "Prediction",
+    }
+
+    _SYNONYMS = {
+        "capex": ["capex", "capital expenditure", "capital expenditures", "property, plant and equipment", "property and equipment"],
+        "fcf": ["fcf", "free cash flow"],
+        "eps": ["eps", "earnings per share", "diluted"],
+        "revenue": ["revenue", "revenues", "net sales", "sales"],
+        "revenues": ["revenue", "revenues", "net sales", "sales"],
+        "sales": ["sales", "net sales", "revenue", "revenues"],
+        "margin": ["margin", "margins", "operating margin", "gross margin"],
+        "margins": ["margin", "margins", "operating margin", "gross margin"],
+        "ad": ["ad", "ads", "advertising"],
+        "ads": ["ad", "ads", "advertising"],
+        "advertising": ["advertising", "ads", "ad"],
+        "growth": ["growth", "increase", "increased", "change", "vs"],
+    }
+
+    _SPECULATIVE_PHRASES = (
+        "should i buy",
+        "should i sell",
+        "buy or sell",
+        "stock price prediction",
+        "price target",
+        "will the stock",
+        "investment advice",
+        "recommend buying",
+        "predict",
+    )
+
     def __init__(self, model_name: str = "offline-deterministic-finsearch"):
         self.model_name = model_name
 
-    def invoke(self, prompt: str) -> str:
-        # Extract the user question and the retrieved context separately
-        question_match = re.search(r"Question:\s*(.*?)(?:\n\s*Structured Financial Answer|\Z)", prompt, re.DOTALL | re.IGNORECASE)
-        question_text = question_match.group(1).strip() if question_match else prompt
-        q_lower = question_text.lower()
-        
-        # Extract context text
-        context_match = re.search(r"Context:\s*(.*?)(?:\n\s*Question:|\Z)", prompt, re.DOTALL | re.IGNORECASE)
-        context_text = context_match.group(1).strip() if context_match else ""
+    def _expand_query_terms(self, question: str) -> List[str]:
+        raw_tokens = re.findall(r"[a-zA-Z0-9\$\.\%\-]+", question.lower())
+        terms: List[str] = []
+        for tok in raw_tokens:
+            clean = tok.strip(".,?!'\"()")
+            if not clean or clean in self._STOPWORDS:
+                continue
+            if len(clean) == 1 and not clean.isdigit():
+                continue
+            if clean not in terms:
+                terms.append(clean)
+            for syn in self._SYNONYMS.get(clean, []):
+                if syn not in terms:
+                    terms.append(syn)
+        return terms
+
+    def _check_out_of_scope(self, question: str, context_text: str) -> bool:
+        if not context_text or not context_text.strip():
+            return True
+
+        q_lower = question.lower()
         c_lower = context_text.lower()
 
-        # Check negative guardrails (disallow unsupported companies or speculative stock advice)
-        unsupported_keywords = ["tesla", "tsla", "nvidia", "nvda", "amazon", "amzn", "fy2025", "stock price prediction", "buy or sell", "should i buy"]
-        if any(unsupported in q_lower for unsupported in unsupported_keywords):
-            if not any(supported in q_lower for supported in ["apple", "aapl", "microsoft", "msft", "alphabet", "googl", "google"]):
-                return "The provided SEC 10-K filings do not contain this information. FinSearch-Pro covers Apple (AAPL), Microsoft (MSFT), and Alphabet (GOOGL) filings up to FY2023."
+        # Refuse speculative / investment advice
+        if any(phrase in q_lower for phrase in self._SPECULATIVE_PHRASES):
+            return True
 
-        # Cross-Company Comparisons
-        if any(w in q_lower for w in ["operating margin", "highest operating margin", "compare operating margin", "which company had the highest"]):
-            return (
-                "Comparative Analysis across Big Tech FY2023 Form 10-K Disclosures:\n\n"
-                "1. **Operating Margins**:\n"
-                "   - **Microsoft (MSFT)**: **41.77%** ($88,523M operating income / $211,915M revenue) - **Highest**\n"
-                "   - **Apple (AAPL)**: **29.82%** ($114,301M operating income / $383,285M net sales)\n"
-                "   - **Alphabet (GOOGL)**: **27.42%** ($84,278M operating income / $307,394M revenue)\n\n"
-                "2. **Capital Expenditures (CapEx)**:\n"
-                "   - Alphabet: $32,251M (Highest, heavy TPU/datacenter expansion)\n"
-                "   - Microsoft: $28,107M (Azure OpenAI datacenter buildout)\n"
-                "   - Apple: $10,959M (Outsourced manufacturing efficiency)\n\n"
-                "3. **Free Cash Flow**:\n"
-                "   - Apple: **$99,584M** (Highest)\n"
-                "   - Alphabet: $69,495M\n"
-                "   - Microsoft: $59,475M"
+        # Check if any explicit proper noun / ticker in the question is absent from context
+        # Strip possessive 's
+        cleaned_q = re.sub(r"'s\b", "", question)
+        candidate_entities = re.findall(r"\b[A-Z][a-zA-Z0-9&\-]{1,}\b", cleaned_q)
+        for ent in candidate_entities:
+            if ent in self._IGNORED_PROPER_NOUNS or re.match(r"^FY\d+$", ent, re.IGNORECASE):
+                continue
+            if ent.lower() not in c_lower:
+                return True
+
+        # Check fiscal years explicitly mentioned in the question (e.g., FY2025, 2025)
+        q_years = re.findall(r"\b(?:FY)?(20\d{2})\b", question, re.IGNORECASE)
+        for yr in q_years:
+            if yr not in c_lower and yr[-2:] not in c_lower:
+                return True
+
+        # Ensure at least one meaningful query term appears in context
+        terms = self._expand_query_terms(question)
+        core_terms = [t for t in terms if not re.match(r"^(fy)?20\d{2}$", t)]
+        if core_terms and not any(t in c_lower for t in core_terms):
+            return True
+
+        return False
+
+    @staticmethod
+    def _parse_doc_blocks(context_text: str) -> List[Dict[str, Any]]:
+        parts = re.split(r"(?=--- \[Document \d+)", context_text)
+        blocks: List[Dict[str, Any]] = []
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            header_match = re.match(
+                r"--- \[Document \d+ \| Ticker: (.*?) \| Section: (.*?) \| FY: (.*?) \| Reranker Relevance Score: (.*?)\] ---\s*(?:Title:\s*(.*?)\n)?(.*)",
+                part,
+                re.DOTALL,
             )
+            if header_match:
+                ticker, section, fy, score_str, title, body = header_match.groups()
+                try:
+                    score = float(score_str)
+                except ValueError:
+                    score = 0.0
+                blocks.append({
+                    "ticker": ticker.strip(),
+                    "section": section.strip(),
+                    "fiscal_year": fy.strip(),
+                    "score": score,
+                    "title": (title or section).strip(),
+                    "body": body.strip(),
+                })
+            else:
+                blocks.append({
+                    "ticker": "DOC",
+                    "section": "Retrieved Context",
+                    "fiscal_year": "N/A",
+                    "score": 0.5,
+                    "title": "Retrieved Financial Context",
+                    "body": part,
+                })
+        return blocks
 
-        # Alphabet / Google queries
-        if any(w in q_lower for w in ["alphabet", "googl", "google", "youtube"]):
-            if "search" in q_lower or "youtube" in q_lower or "ad" in q_lower or "advertising" in q_lower:
-                return (
-                    "According to Alphabet Inc.'s FY2023 Form 10-K (Item 7 - Revenues by Segment and Service):\n\n"
-                    "- **Google Search & other**: $175,033 million (vs. $162,450 million in FY2022)\n"
-                    "- **YouTube ads**: $31,510 million (vs. $29,242 million in FY2022)\n"
-                    "- **Google Network**: $31,312 million\n"
-                    "- **Total Google Advertising**: $237,855 million\n"
-                    "- **Total Alphabet Revenues**: $307,394 million."
-                )
-            if "cloud" in q_lower:
-                return (
-                    "According to Alphabet Inc.'s FY2023 Form 10-K (Item 7 - Segment Breakdown):\n\n"
-                    "- **Google Cloud Revenue**: $33,088 million (up from $26,280 million in FY2022)\n"
-                    "- **Google Cloud Operating Income**: $1,716 million (achieved operating profitability, turning around from $(1,864) million operating loss in FY2022)."
-                )
-            if "free cash flow" in q_lower or "capex" in q_lower or "cash flow" in q_lower:
-                return (
-                    "According to Alphabet Inc.'s FY2023 Form 10-K (Item 8 - Consolidated Statements of Cash Flows):\n\n"
-                    "- **Operating Cash Flow**: $101,746 million\n"
-                    "- **Purchases of Property and Equipment (CapEx)**: $32,251 million\n"
-                    "- **Free Cash Flow**: $69,495 million (+15.8% increase over FY2022)\n\n"
-                    "Calculation: $101,746M - $32,251M = **$69,495 million**."
-                )
-            if "revenue" in q_lower or "net income" in q_lower or "eps" in q_lower:
-                return (
-                    "According to Alphabet Inc.'s FY2023 Form 10-K (Item 8 - Consolidated Statements of Income):\n\n"
-                    "- **Total Revenues**: $307,394 million\n"
-                    "- **Operating Income**: $84,278 million (Operating Margin: 27.42%)\n"
-                    "- **Net Income**: $73,796 million\n"
-                    "- **Diluted EPS**: $5.80 per share."
-                )
+    @staticmethod
+    def _extract_tables_and_prose(body: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+        lines = body.splitlines()
+        tables: List[Dict[str, Any]] = []
+        prose_lines: List[str] = []
 
-        # Microsoft queries
-        if any(w in q_lower for w in ["microsoft", "msft"]):
-            if "cloud" in q_lower or "intelligent cloud" in q_lower:
-                return (
-                    "According to Microsoft Corporation's FY2023 Form 10-K (Item 7 - Segment Revenue):\n\n"
-                    "- **Intelligent Cloud Revenue**: $87,907 million (compared to $75,251 million in FY2022)\n"
-                    "- **YoY Growth**: +16.82% (~17%)\n"
-                    "- **Growth Driver**: Azure and other cloud services revenue grew 29%.\n"
-                    "- **Total Commercial Cloud Revenue**: Exceeded $110 billion across all segments."
-                )
-            if "capex" in q_lower or "free cash flow" in q_lower or "cash flow" in q_lower:
-                return (
-                    "According to Microsoft Corporation's FY2023 Form 10-K (Item 8 - Statements of Cash Flows):\n\n"
-                    "- **Net Cash from Operations**: $87,582 million\n"
-                    "- **Additions to Property and Equipment (CapEx)**: $28,107 million\n"
-                    "- **Free Cash Flow**: $59,475 million\n\n"
-                    "Calculation: $87,582M - $28,107M = **$59,475 million**. CapEx increased to expand global AI infrastructure and datacenters."
-                )
-            if "revenue" in q_lower or "operating income" in q_lower or "net income" in q_lower or "eps" in q_lower:
-                return (
-                    "According to Microsoft Corporation's FY2023 Form 10-K (Item 8 - Income Statements):\n\n"
-                    "- **Total Revenue**: $211,915 million (up from $198,270 million in FY2022)\n"
-                    "- **Operating Income**: $88,523 million (Operating margin: 41.77%)\n"
-                    "- **Net Income**: $72,361 million\n"
-                    "- **Diluted EPS**: $9.68 per share."
-                )
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if line.startswith("|") and i + 1 < len(lines) and re.match(r"^\|\s*[:\-]+", lines[i + 1].strip()):
+                header_cells = [c.strip() for c in line.strip("|").split("|")]
+                sep_line = lines[i + 1].strip()
+                rows: List[List[str]] = []
+                j = i + 2
+                while j < len(lines) and lines[j].strip().startswith("|"):
+                    row_cells = [c.strip() for c in lines[j].strip().strip("|").split("|")]
+                    rows.append(row_cells)
+                    j += 1
+                tables.append({
+                    "headers": header_cells,
+                    "separator": sep_line,
+                    "rows": rows,
+                })
+                i = j
+                continue
+            elif line and not line.startswith("#") and not line.startswith("---"):
+                prose_lines.append(line)
+            i += 1
 
-        # Apple queries
-        if any(w in q_lower for w in ["apple", "aapl"]):
-            if "total net sales" in q_lower or "sales" in q_lower or "revenue" in q_lower:
-                if "iphone" in q_lower or "services" in q_lower:
-                    return (
-                        "According to Apple's FY2023 Form 10-K (Item 7 - Net Sales by Product and Services Category):\n\n"
-                        "- **iPhone Net Sales**: $200,583 million (~52.33% of total net sales)\n"
-                        "- **Services Net Sales**: $85,200 million (~22.23% of total net sales)\n"
-                        "- **Total Net Sales**: $383,285 million (down 2.80% from $394,328 million in FY2022)\n\n"
-                        "Services net sales grew 9% primarily driven by increases in advertising, cloud services, and App Store revenue."
+        # Split prose into sentences
+        prose_text = " ".join(prose_lines)
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", prose_text) if s.strip()]
+        return tables, sentences
+
+    @staticmethod
+    def _parse_number(cell: str) -> Optional[float]:
+        if not cell:
+            return None
+        cleaned = cell.replace("$", "").replace(",", "").replace("%", "").strip()
+        is_neg = False
+        if cleaned.startswith("(") and cleaned.endswith(")"):
+            is_neg = True
+            cleaned = cleaned[1:-1].strip()
+        m = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+        if not m:
+            return None
+        val = float(m.group(0))
+        return -val if is_neg else val
+
+    def _score_text(self, text: str, terms: List[str]) -> float:
+        t_lower = text.lower()
+        score = 0.0
+        for term in terms:
+            if term in t_lower:
+                score += 2.0 if len(term) > 3 else 1.0
+        if re.search(r"\d", text):
+            score += 0.5
+        return score
+
+    def _compute_dynamic_insights(
+        self,
+        question: str,
+        matched_tables: List[Tuple[Dict[str, Any], List[List[str]]]]
+    ) -> List[str]:
+        q_lower = question.lower()
+        insights: List[str] = []
+
+        is_compare_superlative = any(w in q_lower for w in ("highest", "lowest", "largest", "most", "compare", "which company"))
+        is_yoy = any(w in q_lower for w in ("change", "growth", "vs", "compared to", "increase", "decrease"))
+
+        for tbl, rows in matched_tables:
+            headers = tbl["headers"]
+            # Check YoY / multi-column numeric difference on top matched row
+            if is_yoy and len(headers) >= 3 and rows:
+                top_row = rows[0]
+                nums = [(h, self._parse_number(c)) for h, c in zip(headers[1:], top_row[1:])]
+                valid_nums = [(h, n) for h, n in nums if n is not None]
+                if len(valid_nums) >= 2:
+                    h1, v1 = valid_nums[0]
+                    h2, v2 = valid_nums[1]
+                    if v2 != 0:
+                        diff = v1 - v2
+                        pct = (diff / abs(v2)) * 100.0
+                        metric_name = top_row[0].replace("**", "")
+                        insights.append(
+                            f"**Period Change ({metric_name}):** {h1} ({v1:,.2f}) vs {h2} ({v2:,.2f}) -> "
+                            f"Difference: `{diff:+,.2f}` (`{pct:+.2f}%`)"
+                        )
+
+            # Check cross-column superlative (e.g. Company columns in comparison table)
+            if is_compare_superlative and len(headers) >= 3 and rows:
+                top_row = rows[0]
+                # Skip a trailing "Leader" / "Winner" summary column if present
+                col_pairs = [
+                    (h, self._parse_number(c))
+                    for h, c in zip(headers[1:], top_row[1:])
+                    if "leader" not in h.lower() and "winner" not in h.lower()
+                ]
+                valid_cols = [(h, n) for h, n in col_pairs if n is not None]
+                if len(valid_cols) >= 2:
+                    want_min = "lowest" in q_lower or "least" in q_lower
+                    best_h, best_v = (
+                        min(valid_cols, key=lambda x: x[1])
+                        if want_min
+                        else max(valid_cols, key=lambda x: x[1])
                     )
-                return (
-                    "According to Apple's FY2023 Form 10-K (Item 8 - Consolidated Statements of Operations):\n\n"
-                    "- **FY2023 Total Net Sales**: $383,285 million\n"
-                    "- **FY2022 Total Net Sales**: $394,328 million\n"
-                    "- **YoY Variance**: Decrease of $11,043 million (-2.80%)\n\n"
-                    "Arithmetic: ($383,285M - $394,328M) / $394,328M = -2.80%."
-                )
-            if "eps" in q_lower or "net income" in q_lower or "earnings per share" in q_lower:
-                return (
-                    "According to Apple's FY2023 Form 10-K (Item 8 - Consolidated Statements of Operations):\n\n"
-                    "- **Diluted Earnings Per Share (EPS)**: $6.13 (compared to $6.11 in FY2022)\n"
-                    "- **Basic Earnings Per Share**: $6.16\n"
-                    "- **Net Income**: $96,995 million (compared to $99,803 million in FY2022)\n"
-                    "- **Shares used in computing diluted EPS**: 15,812,547 thousand shares."
-                )
-            if "free cash flow" in q_lower or "fcf" in q_lower or "capex" in q_lower or "cash flows" in q_lower:
-                return (
-                    "According to Apple's FY2023 Form 10-K (Item 8 - Consolidated Statements of Cash Flows):\n\n"
-                    "- **Operating Cash Flow**: $110,543 million\n"
-                    "- **Capital Expenditures (Payments for Property, Plant and Equipment)**: $10,959 million\n"
-                    "- **Free Cash Flow**: $99,584 million\n\n"
-                    "Formula & Calculation:\n"
-                    "Free Cash Flow = Cash generated by operating activities - CapEx\n"
-                    "FCF = $110,543M - $10,959M = **$99,584 million**."
+                    metric_name = top_row[0].replace("**", "")
+                    suffix = "%" if "%" in str(top_row[1]) else ""
+                    insights.append(
+                        f"**{'Lowest' if want_min else 'Highest'} {metric_name}:** **{best_h}** (`{best_v:,.2f}{suffix}`)"
+                    )
+
+        return insights
+
+    def invoke(self, prompt: str) -> str:
+        question_match = re.search(
+            r"Question:\s*(.*?)(?:\n\s*Structured Financial Answer|\Z)",
+            prompt,
+            re.DOTALL | re.IGNORECASE,
+        )
+        question_text = question_match.group(1).strip() if question_match else prompt
+
+        context_match = re.search(
+            r"Context:\s*(.*?)(?:\n\s*Question:|\Z)",
+            prompt,
+            re.DOTALL | re.IGNORECASE,
+        )
+        context_text = context_match.group(1).strip() if context_match else ""
+
+        if self._check_out_of_scope(question_text, context_text):
+            return OUT_OF_SCOPE_REFUSAL
+
+        terms = self._expand_query_terms(question_text)
+        blocks = self._parse_doc_blocks(context_text)
+
+        # Rank document blocks by relevance to query terms + reranker score
+        ranked_blocks = []
+        for blk in blocks:
+            title_meta = f"{blk['ticker']} {blk['title']} {blk['section']}"
+            overlap = self._score_text(title_meta + " " + blk["body"], terms)
+            combined_rank = overlap + blk["score"] * 2.0
+            ranked_blocks.append((combined_rank, blk))
+        ranked_blocks.sort(key=lambda x: x[0], reverse=True)
+
+        output_sections: List[str] = []
+        matched_tables_for_calc: List[Tuple[Dict[str, Any], List[List[str]]]] = []
+        citations: List[str] = []
+
+        for _, blk in ranked_blocks[:2]:
+            tables, sentences = self._extract_tables_and_prose(blk["body"])
+            citations.append(f"[{blk['ticker']}] {blk['title']} ({blk['section']})")
+
+            block_parts: List[str] = []
+            for tbl in tables:
+                scored_rows: List[Tuple[float, List[str]]] = []
+                for row in tbl["rows"]:
+                    row_str = " ".join(row)
+                    r_score = self._score_text(row_str, terms)
+                    scored_rows.append((r_score, row))
+
+                # Sort rows by score descending, preserving original order on ties
+                scored_rows.sort(key=lambda x: x[0], reverse=True)
+                # Keep matching rows (or top 5 if table is small)
+                matching_rows = [r for s, r in scored_rows if s > 0.5][:6]
+                if not matching_rows:
+                    matching_rows = tbl["rows"][:5]
+
+                if matching_rows:
+                    matched_tables_for_calc.append((tbl, matching_rows))
+                    header_line = "| " + " | ".join(tbl["headers"]) + " |"
+                    sep_line = tbl["separator"]
+                    row_lines = ["| " + " | ".join(r) + " |" for r in matching_rows]
+                    block_parts.append("\n".join([header_line, sep_line] + row_lines))
+
+            # Top matching prose sentences
+            scored_sents = [(self._score_text(s, terms), s) for s in sentences]
+            scored_sents.sort(key=lambda x: x[0], reverse=True)
+            top_sents = [s for s_score, s in scored_sents if s_score > 0.5][:3]
+            if not top_sents and sentences and not block_parts:
+                top_sents = sentences[:2]
+            if top_sents:
+                block_parts.append("\n".join(f"- {s}" for s in top_sents))
+
+            if block_parts:
+                output_sections.append(
+                    f"### [{blk['ticker']}] {blk['title']}\n" + "\n\n".join(block_parts)
                 )
 
-        return (
-            "Based on the provided SEC 10-K disclosures:\n\n"
-            f"The context includes detailed disclosures for Apple, Microsoft, and Alphabet for FY2023. "
-            "All cited metrics originate directly from SEC Item 7 (MD&A) and Item 8 (Financial Statements)."
-        )
+        if not output_sections:
+            return OUT_OF_SCOPE_REFUSAL
+
+        insights = self._compute_dynamic_insights(question_text, matched_tables_for_calc)
+        if insights:
+            output_sections.append("### Dynamic Calculation & Comparison\n" + "\n".join(f"- {ins}" for ins in insights))
+
+        output_sections.append(f"**Source:** {'; '.join(citations)}")
+        return "\n\n".join(output_sections)
 
 
 class FinSearchChain:
     """
     Unified FinSearch-Pro Chain orchestrating:
-    - Multi-provider LLMs (Gemini, Groq, OpenAI/OpenRouter, Offline)
+    - Multi-provider LLMs (Auto, Gemini, Groq, OpenAI/OpenRouter, Offline)
     - Prompt assembly with multi-column tabular context
     - Document citation and reranker score reporting
     """
+
     def __init__(
         self,
         provider: str = "offline",
@@ -209,7 +449,14 @@ class FinSearchChain:
         api_key: Optional[str] = None,
         retriever_engine: Optional[FinSearchRetrieverEngine] = None
     ):
-        self.provider = provider.lower()
+        self.requested_provider = provider.lower()
+        if self.requested_provider == "auto":
+            resolved_provider, resolved_key = _resolve_auto_provider(api_key)
+            self.provider = resolved_provider
+            api_key = resolved_key
+        else:
+            self.provider = self.requested_provider
+
         self.retriever = retriever_engine or get_finsearch_retriever()
         self.prompt = PromptTemplate(
             template=FINANCIAL_SYSTEM_PROMPT,
@@ -223,7 +470,6 @@ class FinSearchChain:
             selected_model = model_name or "gemini-2.5-flash-lite"
             key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
             if not key:
-                print("Warning: GEMINI_API_KEY not found. Defaulting to Deterministic Offline Mode.")
                 return DeterministicOfflineLLM()
             try:
                 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -240,7 +486,6 @@ class FinSearchChain:
             selected_model = model_name or "llama-3.1-8b-instant"
             key = api_key or os.getenv("GROQ_API_KEY")
             if not key:
-                print("Warning: GROQ_API_KEY not found. Defaulting to Deterministic Offline Mode.")
                 return DeterministicOfflineLLM()
             try:
                 from langchain_groq import ChatGroq
@@ -254,12 +499,12 @@ class FinSearchChain:
                 return DeterministicOfflineLLM()
 
         elif provider in ("openai", "openrouter"):
-            selected_model = model_name or "gpt-4o-mini"
             key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
-            base_url = "https://openrouter.ai/api/v1" if provider == "openrouter" else None
             if not key:
-                print(f"Warning: {provider.upper()} API key not found. Defaulting to Deterministic Offline Mode.")
                 return DeterministicOfflineLLM()
+            is_openrouter = provider == "openrouter" or key.strip().startswith("sk-or-")
+            selected_model = model_name or ("openai/gpt-4.1-nano" if is_openrouter else "gpt-4.1-nano")
+            base_url = "https://openrouter.ai/api/v1" if is_openrouter else None
             try:
                 from langchain_openai import ChatOpenAI
                 return ChatOpenAI(
@@ -272,7 +517,6 @@ class FinSearchChain:
                 print(f"Failed to load ChatOpenAI ({e}). Falling back to Offline LLM.")
                 return DeterministicOfflineLLM()
 
-        # Default: Deterministic Offline Mode
         return DeterministicOfflineLLM()
 
     def format_context(self, scored_docs: List[Tuple[Document, float]]) -> str:
@@ -283,8 +527,11 @@ class FinSearchChain:
             ticker = doc.metadata.get("ticker", "N/A")
             sec_section = doc.metadata.get("section", "N/A")
             fy = doc.metadata.get("fiscal_year", "N/A")
-            
-            section_header = f"--- [Document {i} | Ticker: {ticker} | Section: {sec_section} | FY: {fy} | Reranker Relevance Score: {score:.4f}] ---\nTitle: {title}\n"
+
+            section_header = (
+                f"--- [Document {i} | Ticker: {ticker} | Section: {sec_section} | "
+                f"FY: {fy} | Reranker Relevance Score: {score:.4f}] ---\nTitle: {title}\n"
+            )
             formatted_sections.append(section_header + doc.page_content)
         return "\n\n".join(formatted_sections)
 
@@ -292,7 +539,8 @@ class FinSearchChain:
         self,
         query: str,
         retrieval_strategy: str = "hybrid_rerank",
-        top_k: int = 3
+        top_k: int = 3,
+        ticker_filter: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Executes query answering given retrieval strategy:
@@ -301,18 +549,23 @@ class FinSearchChain:
         - 'hybrid_rerank': Hybrid + Cross-Encoder Rerank
         """
         if retrieval_strategy == "naive":
-            raw_docs = self.retriever.naive_vector_retrieve(query, top_k=top_k)
+            raw_docs = self.retriever.naive_vector_retrieve(
+                query, top_k=top_k, ticker_filter=ticker_filter
+            )
             scored_docs = [(d, 0.5) for d in raw_docs]
         elif retrieval_strategy == "hybrid":
-            raw_docs = self.retriever.hybrid_retrieve(query, top_k=top_k)
+            raw_docs = self.retriever.hybrid_retrieve(
+                query, top_k=top_k, ticker_filter=ticker_filter
+            )
             scored_docs = [(d, 0.75) for d in raw_docs]
-        else: # hybrid_rerank (default)
-            scored_docs = self.retriever.retrieve_and_rerank(query, top_k_retrieve=6, top_k_rerank=top_k)
+        else:  # hybrid_rerank (default)
+            scored_docs = self.retriever.retrieve_and_rerank(
+                query, top_k_retrieve=6, top_k_rerank=top_k, ticker_filter=ticker_filter
+            )
 
         context_text = self.format_context(scored_docs)
         formatted_prompt = self.prompt.format(context=context_text, question=query)
 
-        # Run LLM
         if isinstance(self.llm, DeterministicOfflineLLM):
             response_text = self.llm.invoke(formatted_prompt)
         else:
@@ -327,6 +580,8 @@ class FinSearchChain:
             "query": query,
             "answer": response_text,
             "retrieval_strategy": retrieval_strategy,
+            "ticker_filter": ticker_filter or "ALL",
+            "provider": self.provider,
             "scored_documents": scored_docs,
             "context_used": context_text
         }
