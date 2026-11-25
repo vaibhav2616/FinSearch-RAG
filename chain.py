@@ -106,11 +106,19 @@ class DeterministicOfflineLLM:
         "Show", "List", "Calculate", "Tell", "Give", "Explain", "Does", "Did",
         "Was", "Were", "Are", "Is", "The", "In", "For", "Of", "And", "Or",
         "Among", "Between", "Should", "Could", "Would", "Can", "Will",
+        "Summarize", "Analyze", "Analyse", "Evaluate", "Report", "Check",
+        "Find", "Provide", "Compute", "Determine", "Highlight", "Outline",
+        "Detail", "Overview", "Please", "Break", "Describe", "State",
         "Revenue", "Revenues", "Sales", "Net", "Income", "Operating", "Margin",
         "Margins", "Gross", "Profit", "Cash", "Flow", "Free", "Capital",
         "Expenditures", "Expenditure", "CapEx", "EPS", "Diluted", "Basic",
         "Total", "Segment", "Cloud", "Search", "Services", "Products",
         "Product", "Assets", "Liabilities", "Equity", "Balance", "Sheet",
+        "Research", "Development", "Expenses", "Growth", "Debt", "Tax",
+        "Taxes", "Shares", "Dividend", "Dividends", "Quarter", "Annual",
+        "Filing", "Filings", "Statement", "Statements", "Consolidated",
+        "Segments", "Data", "Metrics", "Numbers", "Figures", "Results",
+        "Performance", "Breakdown", "Summary",
         "FY", "FY2021", "FY2022", "FY2023", "FY2024", "FY2025", "FY21", "FY22",
         "FY23", "FY24", "FY25", "Q1", "Q2", "Q3", "Q4", "USD", "GAAP", "SEC",
         "10-K", "MD&A", "Item", "YoY", "AI", "Stock", "Price", "Prediction",
@@ -184,9 +192,9 @@ class DeterministicOfflineLLM:
                 return True
 
         # Check fiscal years explicitly mentioned in the question (e.g., FY2025, 2025)
-        q_years = re.findall(r"\b(?:FY)?(20\d{2})\b", question, re.IGNORECASE)
+        q_years = re.findall(r"\b(?:FY\s*)?(20\d{2})\b", question, re.IGNORECASE)
         for yr in q_years:
-            if yr not in c_lower and yr[-2:] not in c_lower:
+            if yr not in c_lower and not re.search(rf"\bfy\s*{yr[-2:]}\b", c_lower):
                 return True
 
         # Ensure at least one meaningful query term appears in context
@@ -308,19 +316,30 @@ class DeterministicOfflineLLM:
         for tbl, rows in matched_tables:
             headers = tbl["headers"]
             # Check YoY / multi-column numeric difference on top matched row
-            if is_yoy and len(headers) >= 3 and rows:
+            is_time_table = any(
+                re.search(r"(?:20\d{2}|\bfy\b|\bq[1-4]\b|year|period)", h, re.IGNORECASE)
+                for h in headers[1:]
+            )
+            if is_yoy and is_time_table and len(headers) >= 3 and rows:
                 top_row = rows[0]
                 nums = [(h, self._parse_number(c)) for h, c in zip(headers[1:], top_row[1:])]
                 valid_nums = [(h, n) for h, n in nums if n is not None]
                 if len(valid_nums) >= 2:
                     h1, v1 = valid_nums[0]
                     h2, v2 = valid_nums[1]
-                    if v2 != 0:
-                        diff = v1 - v2
-                        pct = (diff / abs(v2)) * 100.0
+                    y1_m = re.search(r"(20\d{2})", h1)
+                    y2_m = re.search(r"(20\d{2})", h2)
+                    # Ensure newer period minus older period regardless of column order
+                    if y1_m and y2_m and int(y1_m.group(1)) < int(y2_m.group(1)):
+                        new_h, new_v, old_h, old_v = h2, v2, h1, v1
+                    else:
+                        new_h, new_v, old_h, old_v = h1, v1, h2, v2
+                    if old_v != 0:
+                        diff = new_v - old_v
+                        pct = (diff / abs(old_v)) * 100.0
                         metric_name = top_row[0].replace("**", "")
                         insights.append(
-                            f"**Period Change ({metric_name}):** {h1} ({v1:,.2f}) vs {h2} ({v2:,.2f}) -> "
+                            f"**Period Change ({metric_name}):** {new_h} ({new_v:,.2f}) vs {old_h} ({old_v:,.2f}) -> "
                             f"Difference: `{diff:+,.2f}` (`{pct:+.2f}%`)"
                         )
 

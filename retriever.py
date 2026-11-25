@@ -256,29 +256,37 @@ class FinSearchRetrieverEngine:
                         )
                     )
         elif ext == ".csv":
-            df = pd.read_csv(io.BytesIO(file_bytes))
-            headers = [str(c) for c in df.columns]
-            md_lines = [
-                "| " + " | ".join(headers) + " |",
-                "| " + " | ".join([":---"] * len(headers)) + " |",
-            ]
+            try:
+                df = pd.read_csv(io.BytesIO(file_bytes))
+            except pd.errors.EmptyDataError:
+                return 0
+            if df.empty or len(df.columns) == 0:
+                return 0
+            headers = [str(c).replace("|", "\\|").strip() for c in df.columns]
+            header_md = "| " + " | ".join(headers) + " |"
+            sep_md = "| " + " | ".join([":---"] * len(headers)) + " |"
+            row_lines = []
             for _, row in df.iterrows():
-                vals = [str(v).replace("\n", " ").strip() for v in row.tolist()]
-                md_lines.append("| " + " | ".join(vals) + " |")
-            md_table = f"# {filename}\n\n" + "\n".join(md_lines)
-            docs.append(
-                Document(
-                    page_content=md_table,
-                    metadata={
-                        "ticker": clean_ticker,
-                        "company": filename,
-                        "fiscal_year": "Uploaded",
-                        "section": "CSV Financial Table",
-                        "title": filename,
-                        "source": filename,
-                    },
+                vals = [str(v).replace("\n", " ").replace("|", "\\|").strip() for v in row.tolist()]
+                row_lines.append("| " + " | ".join(vals) + " |")
+            batch_size = 25
+            for start in range(0, len(row_lines), batch_size):
+                batch = row_lines[start : start + batch_size]
+                part_suffix = f" (Part {start // batch_size + 1})" if len(row_lines) > batch_size else ""
+                md_table = f"# {filename}{part_suffix}\n\n" + "\n".join([header_md, sep_md] + batch)
+                docs.append(
+                    Document(
+                        page_content=md_table,
+                        metadata={
+                            "ticker": clean_ticker,
+                            "company": filename,
+                            "fiscal_year": "Uploaded",
+                            "section": f"CSV Financial Table{part_suffix}",
+                            "title": f"{filename}{part_suffix}",
+                            "source": filename,
+                        },
+                    )
                 )
-            )
         elif ext in (".txt", ".md"):
             text = file_bytes.decode("utf-8", errors="replace").strip()
             if text:
@@ -313,7 +321,8 @@ class FinSearchRetrieverEngine:
         self,
         docs: List[Document],
         ticker_filter: Optional[str],
-        top_k: int
+        top_k: int,
+        query: str = ""
     ) -> List[Document]:
         """Filters retrieved documents by ticker if ticker_filter is specified and not 'ALL'."""
         if not ticker_filter or ticker_filter.strip().upper() == "ALL":
@@ -323,16 +332,25 @@ class FinSearchRetrieverEngine:
         filtered = [d for d in docs if str(d.metadata.get("ticker", "")).upper() == target]
 
         if len(filtered) < top_k:
-            # Backfill from raw_documents matching the ticker so filtered queries never miss
+            # Backfill from raw_documents matching the ticker, ranked by query term overlap
             existing_contents = {d.page_content for d in filtered}
             matching_raw = [
                 d for d in self.raw_documents
                 if str(d.metadata.get("ticker", "")).upper() == target
             ]
-            for chunk in self.parent_splitter.split_documents(matching_raw):
-                if chunk.page_content not in existing_contents:
-                    filtered.append(chunk)
-                    existing_contents.add(chunk.page_content)
+            q_terms = set(re.findall(r"[a-zA-Z0-9]+", query.lower()))
+            candidates = [
+                chunk for chunk in self.parent_splitter.split_documents(matching_raw)
+                if chunk.page_content not in existing_contents
+            ]
+            if q_terms:
+                candidates.sort(
+                    key=lambda c: sum(1 for t in q_terms if t in c.page_content.lower()),
+                    reverse=True,
+                )
+            for chunk in candidates:
+                filtered.append(chunk)
+                existing_contents.add(chunk.page_content)
                 if len(filtered) >= top_k:
                     break
 
@@ -347,7 +365,7 @@ class FinSearchRetrieverEngine:
         """Performs baseline naive dense vector retrieval (direct similarity on parent docs)."""
         docs = self.parent_retriever.invoke(query)
         if ticker_filter and ticker_filter.strip().upper() != "ALL":
-            return self._apply_ticker_filter(docs, ticker_filter, top_k)
+            return self._apply_ticker_filter(docs, ticker_filter, top_k, query=query)
         return docs[:top_k]
 
     def hybrid_retrieve(
@@ -361,7 +379,7 @@ class FinSearchRetrieverEngine:
             return self.naive_vector_retrieve(query, top_k=top_k, ticker_filter=ticker_filter)
         docs = self.ensemble_retriever.invoke(query)
         if ticker_filter and ticker_filter.strip().upper() != "ALL":
-            return self._apply_ticker_filter(docs, ticker_filter, top_k)
+            return self._apply_ticker_filter(docs, ticker_filter, top_k, query=query)
         return docs[:top_k]
 
     def rerank(

@@ -120,6 +120,34 @@ def _build_theme_css(mode: str) -> str:
             background-color: {accent} !important;
             color: {accent_text} !important;
         }}
+        [data-testid="stChatInput"],
+        [data-testid="stChatInput"] > div {{
+            background-color: {bg_surface} !important;
+            border-color: {border_col} !important;
+        }}
+        [data-testid="stChatInputTextArea"],
+        [data-testid="stChatInput"] textarea {{
+            background-color: {bg_surface} !important;
+            color: {text_primary} !important;
+        }}
+        [data-testid="stChatInputTextArea"]::placeholder,
+        [data-testid="stChatInput"] textarea::placeholder {{
+            color: {text_muted} !important;
+        }}
+        [data-testid="stFileUploaderDropzone"] {{
+            background-color: {bg_surface} !important;
+            color: {text_primary} !important;
+            border: 1px dashed {border_col} !important;
+        }}
+        [data-testid="stMetricValue"], [data-testid="stMetricLabel"] {{
+            color: {text_primary} !important;
+        }}
+        [data-baseweb="tab"] {{
+            color: {text_muted} !important;
+        }}
+        [data-baseweb="tab"][aria-selected="true"] {{
+            color: {accent} !important;
+        }}
         [data-testid="stAlertContainer"] {{
             background-color: {alert_bg} !important;
             color: {text_primary} !important;
@@ -213,35 +241,6 @@ with st.sidebar:
 
     st.divider()
 
-    st.markdown("#### Retrieval & Filtering")
-    strategy_label = st.radio(
-        "RAG Pipeline Strategy",
-        options=[
-            "Hybrid + Cross-Encoder Reranker",
-            "Hybrid Search (BM25 + Dense RRF)",
-            "Naive Vector Search",
-        ],
-        index=0,
-        key="retrieval_strategy_label",
-    )
-    strat_map = {
-        "Hybrid + Cross-Encoder Reranker": "hybrid_rerank",
-        "Hybrid Search (BM25 + Dense RRF)": "hybrid",
-        "Naive Vector Search": "naive",
-    }
-    retrieval_strategy = strat_map[strategy_label]
-    top_k_slider = st.slider("Max Parent Documents", min_value=1, max_value=5, value=3, key="top_k_slider")
-
-    available_tickers = engine.get_available_tickers()
-    ticker_filter = st.selectbox(
-        "Filter by Ticker",
-        options=["ALL"] + available_tickers,
-        index=0,
-        key="ticker_filter",
-    )
-
-    st.divider()
-
     st.markdown("#### Live Document Uploader")
     upload_ticker = st.text_input("Ticker Tag for Uploads", value="CUSTOM", key="upload_ticker")
     uploaded_files = st.file_uploader(
@@ -265,6 +264,34 @@ with st.sidebar:
 
     available_tickers = engine.get_available_tickers()
     st.metric("Indexed Documents", len(engine.raw_documents), f"{len(available_tickers)} Tickers")
+
+    st.divider()
+
+    st.markdown("#### Retrieval & Filtering")
+    strategy_label = st.radio(
+        "RAG Pipeline Strategy",
+        options=[
+            "Hybrid + Cross-Encoder Reranker",
+            "Hybrid Search (BM25 + Dense RRF)",
+            "Naive Vector Search",
+        ],
+        index=0,
+        key="retrieval_strategy_label",
+    )
+    strat_map = {
+        "Hybrid + Cross-Encoder Reranker": "hybrid_rerank",
+        "Hybrid Search (BM25 + Dense RRF)": "hybrid",
+        "Naive Vector Search": "naive",
+    }
+    retrieval_strategy = strat_map[strategy_label]
+    top_k_slider = st.slider("Max Parent Documents", min_value=1, max_value=5, value=3, key="top_k_slider")
+
+    ticker_filter = st.selectbox(
+        "Filter by Ticker",
+        options=["ALL"] + available_tickers,
+        index=0,
+        key="ticker_filter",
+    )
 
 # Inject Theme CSS
 st.html(_build_theme_css(theme_mode))
